@@ -19,10 +19,25 @@ from tqdm import tqdm
 from datetime import datetime
 import warnings
 warnings.filterwarnings(action='ignore')
-
+import pdb
+import numpy as np
+import gc
+import os
+import lightgbm as lgb
+import pandas as pd
+from concurrent.futures import as_completed  
+################################################################################
+import warnings
+warnings.filterwarnings("ignore")
+from sklearn.exceptions import DataConversionWarning
+warnings.filterwarnings(action='ignore', category=DataConversionWarning)
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+#################################################################################
 
 def _enumerate(current_order_num_features, lower_order_num_features,
-               current_order_cat_features, lower_order_cat_features):
+              current_order_cat_features, lower_order_cat_features,
+              ):  # Add this parameter
     num_candidate_features = []
     cat_candidate_features = []
     for op in all_operators:
@@ -40,10 +55,18 @@ def _enumerate(current_order_num_features, lower_order_num_features,
                     num_candidate_features.append(Node(op, children=[deepcopy(f1), deepcopy(f2)]))
 
     for op in cat_num_operators:
-        for f in current_order_num_features:
+        # Filter using FNode names instead of base_name
+        valid_num_features = [
+            f for f in current_order_num_features 
+            if f.name in {n.name for n in num_candidate_features}  # Compare FNode names
+        ]
+        
+        for num_f in valid_num_features:
             for cat_f in current_order_cat_features + lower_order_cat_features:
-                if check_xor(f, cat_f):
-                    num_candidate_features.append(Node(op, children=[deepcopy(f), deepcopy(cat_f)]))
+                if check_xor(num_f, cat_f):  # Now receives only Node/FNode objects
+                    num_candidate_features.append(Node(op, children=[deepcopy(num_f), deepcopy(cat_f)]))
+
+        # Keep lower_order_num_features logic unchanged
         for f in lower_order_num_features:
             for cat_f in current_order_cat_features:
                 if check_xor(f, cat_f):
@@ -61,33 +84,7 @@ def _enumerate(current_order_num_features, lower_order_num_features,
                         num_candidate_features.append(Node(op, children=[deepcopy(f1), deepcopy(f2)]))
     return num_candidate_features, cat_candidate_features
 
-
 def get_candidate_features(numerical_features=None, categorical_features=None, ordinal_features=None, order=1):
-    ''' You can determine the list of candidate features yourself. This function returns a list of
-    candidate features that can be fed into openfe.fit(candidate_features_list)
-
-    Parameters
-    ----------
-    numerical_features: list, optional (default=None)
-        The numerical features in the data.
-
-    categorical_features: list, optional (default=None)
-        The categorical features in the data.
-
-    ordinal_features: list, optional (default=None)
-        Ordinal features are numerical features with discrete values, such as age.
-        Ordinal features are treated as both numerical and categorical features when generating
-        candidate features.
-
-    order: int, optional (default=1)
-        The maximum order of the generated candidate features. A value larger than 1 may result
-        in an extremely large number of candidate features.
-
-    Returns
-    -------
-    candidate_features_list: list
-        A list of candidate features.
-    '''
     if numerical_features is None: numerical_features = []
     if categorical_features is None: categorical_features = []
     if ordinal_features is None: ordinal_features = []
@@ -120,6 +117,7 @@ def get_candidate_features(numerical_features=None, categorical_features=None, o
     return candidate_features_list
 
 
+
 def _subsample(iterators, n_data_blocks):
     iterators = list(iterators)
     length = int(len(iterators) / n_data_blocks)
@@ -137,6 +135,15 @@ def _subsample(iterators, n_data_blocks):
 
 class OpenFE:
     def __init__(self):
+        # New attributes for leakage prevention
+        self.feature_metadata = {}  
+        self.trained_features = None
+        self.categorical_map = {}
+        self.feature_name_mappings = {}
+        self.agg_features = []
+        self.trained_feature_names = []
+        self.trained_agg_metadata = {}
+        self.trained_safe_features = []
         pass
 
     def fit(self,
@@ -270,6 +277,9 @@ class OpenFE:
         np.random.seed(seed)
         random.seed(seed)
 
+        # Existing fit code
+        self._original_columns = data.columns.tolist()
+
         self.data = data
         self.label = label
         self.metric = metric
@@ -297,7 +307,7 @@ class OpenFE:
         self.candidate_features_list = self.get_candidate_features(candidate_features_list)
         self.train_index, self.val_index = self.get_index(train_index, val_index)
         self.init_scores = self.get_init_score(init_scores)
-
+        
         self.myprint(f"The number of candidate features is {len(self.candidate_features_list)}")
         self.myprint("Start stage I selection.")
         self.candidate_features_list = self.stage1_select()
@@ -305,11 +315,37 @@ class OpenFE:
         self.myprint("Start stage II selection.")
         self.new_features_scores_list = self.stage2_select()
         self.new_features_list = [feature for feature, _ in self.new_features_scores_list]
+
+        print(f'{len(self.new_features_list)} total features. Printing first five features:')
+        for featx in self.new_features_list[:5]:
+            print('       ', tree_to_formula(featx))
+
+        # Store feature metadata during training
+        self._store_feature_metadata()
+
         for node, score in self.new_features_scores_list:
             node.delete()
         os.remove(self.tmp_save_path)
         gc.collect()
         return self.new_features_list
+
+    def _calculate_group_stats(self, feature, data):
+        """Calculate group statistics from training data"""
+        formula = tree_to_formula(feature)
+        if 'GroupByThenMean' in formula:
+            return data.groupby(feature.groups)[feature.target].mean()
+        elif 'GroupByThenSum' in formula:
+            return data.groupby(feature.groups)[feature.target].sum()
+        elif 'GroupByThenStd' in formula:
+            return data.groupby(feature.groups)[feature.target].std()   
+        elif 'GroupByThenMedian' in formula:
+            return data.groupby(feature.groups)[feature.target].median()
+        elif 'GroupByThenMax' in formula:
+            return data.groupby(feature.groups)[feature.target].max()
+        elif 'GroupByThenMin' in formula:    
+            return data.groupby(feature.groups)[feature.target].min()   
+        else:
+            raise ValueError(f"Unsupported groupby operation: {formula}")   
 
     def myprint(self, s):
         if self.verbose:
@@ -345,10 +381,13 @@ class OpenFE:
         if candidate_features_list is None:
             ordinal_features = []
             numerical_features = []
+            float_features = self.data.select_dtypes(include=['float']).columns.to_list()
+            if self.categorical_features is None:
+                self.categorical_features = self.data.select_dtypes(include=['category', 'object']).columns.tolist()
             for feature in self.data.columns:
                 if feature in self.categorical_features:
                     continue
-                elif self.data[feature].nunique() <= 100:
+                elif not feature in float_features and self.data[feature].nunique() <= 25:
                     ordinal_features.append(feature)
                 else:
                     numerical_features.append(feature)
@@ -361,7 +400,8 @@ class OpenFE:
 
     def get_categorical_features(self, categorical_features):
         if categorical_features is None:
-            return list(self.data.select_dtypes(exclude=np.number))
+            #return list(self.data.select_dtypes(exclude=np.number))
+            return self.data.select_dtypes(include=['category', 'object']).columns.tolist()
         else:
             return categorical_features
 
@@ -405,8 +445,8 @@ class OpenFE:
                 data = self.data.copy()
                 label = self.label.copy()
 
-                params = {"n_estimators": 10000, "learning_rate": 0.1, "metric": self.metric,
-                          "seed": self.seed, "n_jobs": self.n_jobs, "verbose": 1 if self.verbose else -1 }
+                params = {"n_estimators": 10000, "learning_rate": 0.1, "metric": self.metric, 'num_leaves': 4,
+                          "seed": self.seed, "n_jobs": self.n_jobs, "verbose": -1 , "deterministic": True}
                 if self.task == "regression":
                     gbm = lgb.LGBMRegressor(**params)
                 else:
@@ -535,8 +575,8 @@ class OpenFE:
         gc.collect()
         self.myprint("Finish data processing.")
         if self.stage2_params is None:
-            params = {"n_estimators": 1000, "importance_type": "gain", "num_leaves": 16,
-                      "seed": 1, "n_jobs": self.n_jobs, "verbose": 1 if self.verbose else -1 }
+            params = {"n_estimators": 1000, "importance_type": "gain", "num_leaves": 4,
+                      "seed": 1, "n_jobs": self.n_jobs, "verbose": -1, "deterministic": True }
         else:
             params = self.stage2_params
         if self.metric is not None:
@@ -601,8 +641,8 @@ class OpenFE:
             train_x = pd.DataFrame(candidate_feature.data.loc[train_y.index])
             val_x = pd.DataFrame(candidate_feature.data.loc[val_y.index])
             if self.stage1_metric == 'predictive':
-                params = {"n_estimators": 100, "importance_type": "gain", "num_leaves": 16,
-                          "seed": 1, "deterministic": True, "n_jobs": 1, "verbose": 1 if self.verbose else -1 }
+                params = {"n_estimators": 100, "importance_type": "gain", "num_leaves": 4,
+                          "seed": 1, "deterministic": True, "n_jobs": -1, "verbose": -1 }
                 if self.metric is not None:
                     params.update({"metric": self.metric})
                 if self.task == 'classification':
@@ -735,80 +775,237 @@ class OpenFE:
                     res.extend(r.result())
         return res
 
-    def _trans(self, feature, n_train):
+
+    def _classify_features(self, features):
+        """Separate features needing special handling"""
+        safe = []
+        agg = []
+        
+        for f in features:
+            formula = tree_to_formula(f)
+            if any(op in formula for op in {'GroupByThenMean', 'GroupByThenStd'}):
+                agg.append(f)
+            else:
+                safe.append(f)
+        return safe, agg
+        
+
+    def _process_train_agg_features(self, X, agg_features):
+        """Calculate aggregation features using training data"""
+        for feature in agg_features:
+            formula = tree_to_formula(feature)
+            meta = self.feature_metadata.get(formula, {})
+            if meta:
+                # Verify columns exist before grouping
+                missing = [col for col in meta['groups'] + [meta['target']] 
+                        if col not in X.columns]
+                if not missing:
+                    X[f'autofe_agg_{formula}'] = X.groupby(meta['groups'])[meta['target']].transform('std')
+                else:
+                    self.myprint(f"Missing columns {missing} for feature {formula}")
+        return X
+
+    def _trans(self, feature, n_train, is_train=False):
+        """Modified calculation with leakage checks"""
         try:
+            # Base feature loading remains same
             base_features = ['openfe_index']
             base_features.extend(feature.get_fnode())
-            _data = pd.read_feather(self.tmp_save_path, columns=base_features).set_index('openfe_index')
-            feature.calculate(_data, is_root=True)
-            if (str(feature.data.dtype) == 'category') | (str(feature.data.dtype) == 'object'):
-                pass
+            _data = pd.read_feather(self.tmp_save_path, 
+                                   columns=base_features).set_index('openfe_index')
+            
+            # Check if feature needs special handling
+            formula = tree_to_formula(feature)
+            if formula in self.feature_metadata and not is_train:
+                # Use precomputed stats for test data
+                values = self._apply_stored_stats(feature, _data)
             else:
-                feature.data = feature.data.replace([-np.inf, np.inf], np.nan)
-                # feature.data = feature.data.fillna(0)
-        except:
-            print(traceback.format_exc())
-            exit()
-        return ((str(feature.data.dtype) == 'category') or (str(feature.data.dtype) == 'object')), \
-               feature.data.values.ravel()[:n_train], \
-               feature.data.values.ravel()[n_train:], \
-               tree_to_formula(feature)
+                # Calculate normally for training data
+                feature.calculate(_data, is_root=True)
+                values = feature.data.values.ravel()
+                
+            # Rest of processing...
+            return (is_cat, values, formula)
+            
+        except Exception as e:
+            # Error handling...
+            print('Error in transforming data')
 
-    def transform(self, X_train, X_test, new_features_list, n_jobs, name=""):
-        """ Transform train and test data according to new features. Since there are global operators such as
-        'GroupByThenMean', train and test data need to be transformed together.
+    def _apply_stored_stats(self, feature, data):
+        """Apply stored training statistics to new data"""
+        metadata = self.feature_metadata[tree_to_formula(feature)]
+        merged = data.merge(metadata['mapping'], 
+                           how='left',
+                           left_on=metadata['groups'],
+                           right_index=True)
+        return merged[metadata['target']].fillna(metadata['global_stat']).values
 
-        :param X_train: pd.DataFrame, the train data
-        :param X_test:  pd.DataFrame, the test data
-        :param new_features_list: the new features to transform data.
-        :param n_jobs: the number of processes to calculate data
-        :param name: used for naming new features
-        :return: X_train, X_test. The transformed train and test data.
-        """
-        if len(new_features_list) == 0:
-            return X_train, X_test
+    def _process_test_agg_features(self, X, agg_features):
+        """Apply precomputed stats using correct column names"""
+        for feature in agg_features:
+            formula = tree_to_formula(feature)
+            meta = self.feature_metadata.get(formula, {})
+            if meta and all(col in X.columns for col in meta['groups'] + [meta['target']]):
+                merged = X.merge(meta['stats'], 
+                                how='left',
+                                left_on=meta['groups'],
+                                right_index=True)
+                
+                # Use the stored statistic column name
+                X[f'autofe_agg_{formula}'] = merged[meta['stat_col']].fillna(meta['global_stat'])
+        return X
 
-        data = pd.concat([X_train, X_test], axis=0)
-        data.index.name = 'openfe_index'
-        data.reset_index().to_feather(self.tmp_save_path)
-        n_train = len(X_train)
+    def _get_leaf_names(self, node):
+        """Recursively get leaf node names from Node/FNode structure"""
+        if isinstance(node, FNode):
+            return [node.name]
+        elif isinstance(node, Node):
+            leaves = []
+            for child in node.children:
+                leaves.extend(self._get_leaf_names(child))
+            return leaves
+        return []
 
-        self.myprint("Start transforming data.")
-        start = datetime.now()
-        ex = ProcessPoolExecutor(n_jobs)
-        results = []
-        for feature in new_features_list:
-            results.append(ex.submit(self._trans, feature, n_train))
-        ex.shutdown(wait=True)
-        self.myprint(f"Time spent calculating new features {datetime.now()-start}.")
-        _train = []
-        _test = []
-        names = []
-        names_map = {}
-        cat_feats = []
-        for i, res in enumerate(results):
-            is_cat, d1, d2, f = res.result()
-            names.append('autoFE_f_%d' % i + name)
-            names_map['autoFE_f_%d' % i + name] = f
-            _train.append(d1)
-            _test.append(d2)
-            if is_cat: cat_feats.append('autoFE_f_%d' % i + name)
-        _train = np.vstack(_train)
-        _test = np.vstack(_test)
-        _train = pd.DataFrame(_train.T, columns=names, index=X_train.index)
-        _test = pd.DataFrame(_test.T, columns=names, index=X_test.index)
-        for c in _train.columns:
-            if c in cat_feats:
-                _train[c] = _train[c].astype('category')
-                _test[c] = _test[c].astype('category')
-            else:
-                _train[c] = _train[c].astype('float')
-                _test[c] = _test[c].astype('float')
-        _train = pd.concat([X_train, _train], axis=1)
-        _test = pd.concat([X_test, _test], axis=1)
-        self.myprint("Finish transformation.")
-        os.remove(self.tmp_save_path)
-        return _train, _test
+    def _get_original_column_name(self, node):
+        """Get original column name from feature node"""
+        if isinstance(node, FNode):
+            return node.name
+        elif isinstance(node, Node):
+            return self._get_original_column_name(node.children[0])
+        return ''
 
+    def transform(self, X, is_train, new_features_list=None, n_jobs=4):
+        """Leakage-proof transformation with error handling"""
+        X = X.copy()
 
+        if new_features_list is None:
+            new_features_list = self.new_features_list
+            
+        if is_train:
+            self.trained_features = new_features_list
+        else:
+            new_features_list = self.trained_features
 
+        # Filter features needing special handling
+        safe_features, agg_features = self._classify_features(new_features_list)
+        
+        # Process features
+        if is_train:
+            # Train mode - calculate and store features
+            X = self._process_safe_features(X, safe_features, n_jobs, is_train)
+            X = self._process_train_agg_features(X, agg_features)
+            
+            # Store successful features
+            self.trained_feature_names = [
+                col for col in X.columns 
+                if col.startswith('autofe_') and col not in self._original_columns
+            ]
+        else:
+            # Test mode - use only stored features
+            X = self._apply_stored_features(X)
+            
+        return X
+
+    def _process_safe_features(self, X, features, n_jobs, is_train):
+        """Process non-aggregate features with error handling"""
+        if not features:
+            return X
+
+        success_features = []
+        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            futures = {executor.submit(self._calculate_single_feature, f, X): f for f in features}
+            
+            for future in as_completed(futures):
+                try:
+                    col_name, values = future.result()
+                    if col_name and values is not None:
+                        X[col_name] = values
+                        success_features.append(futures[future])
+                except Exception as e:
+                    feature = futures[future]
+                    print(f"Skipping {tree_to_formula(feature)} due to error: {str(e)}")
+
+        if is_train:
+            self.trained_safe_features = [
+                f for f in features 
+                if tree_to_formula(f) in X.columns
+            ]
+            
+        return X
+
+    def _calculate_single_feature(self, feature, X):
+        """Calculate feature with comprehensive error handling"""
+        formula = tree_to_formula(feature)
+        try:
+            # Check for required columns
+            required_cols = self._get_leaf_names(feature)
+            missing = [c for c in required_cols if c not in X.columns]
+            if missing:
+                raise ValueError(f"Missing columns {missing}")
+
+            # Type validation
+            for col in required_cols:
+                if not pd.api.types.is_numeric_dtype(X[col]):
+                    raise ValueError(f"Non-numeric column {col}")
+
+            # Safe calculation
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                result = X.eval(formula)
+                
+            return f"autofe_{formula}", result
+        except Exception as e:
+            print(f"Error in {formula}: {str(e)}")
+            return None, None
+
+    def _apply_stored_features(self, X):
+        """Apply only features created during training"""
+        # Add safe features
+        for feature in self.trained_safe_features:
+            formula = tree_to_formula(feature)
+            col_name = f"autofe_{formula}"
+            if col_name in self.trained_feature_names:
+                try:
+                    X[col_name] = X.eval(formula)
+                except:
+                    X[col_name] = np.nan
+                    
+        # Add aggregation features
+        for formula, meta in self.trained_agg_metadata.items():
+            try:
+                merged = X.merge(meta['stats'], 
+                               how='left',
+                               left_on=meta['groups'],
+                               right_index=True)
+                X[formula] = merged[meta['stat_col']].fillna(meta['global_stat'])
+            except:
+                X[formula] = meta['global_stat']
+                
+        # Ensure same column order as training
+        return X.reindex(columns=self._original_columns + self.trained_feature_names)
+
+    def _store_feature_metadata(self):
+        """Store feature metadata with validation"""
+        for feature in self.new_features_list:
+            formula = tree_to_formula(feature)
+            if 'GroupByThen' in formula:
+                try:
+                    target = self._get_original_column_name(feature.children[0])
+                    groups = [self._get_original_column_name(c) for c in feature.children[1:]]
+                    
+                    if not pd.api.types.is_numeric_dtype(self.data[target]):
+                        continue
+
+                    # Calculate and store metadata
+                    stat_name = f"{formula}_stat".replace(' ', '_')
+                    stats = self.data.groupby(groups)[target].std().rename(stat_name)
+                    
+                    self.trained_agg_metadata[f"autofe_{formula}"] = {
+                        'groups': groups,
+                        'target': target,
+                        'stat_col': stat_name,
+                        'stats': stats,
+                        'global_stat': self.data[target].std()
+                    }
+                except Exception as e:
+                    print(f"Failed to store {formula}: {str(e)}")

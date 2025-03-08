@@ -4,11 +4,11 @@ with open("README.md", "r") as fh:
   long_description = fh.read()
 
 setup(
-  name="openfe",
-  version="0.0.8",
-  author="Tianping Zhang",
-  author_email="ztp18@mails.tsinghua.edu.cn",
-  description="OpenFE: automated feature generation beyond expert-level performance",
+  name="leakage_free_openfe",
+  version="0.1",
+  author="original by: Tianping Zhang, modified by: Ram Seshadri",
+  author_email="",
+  description="Leakage-Free-OpenFE: automated feature generation without data leakage",
   long_description=long_description,
   long_description_content_type="text/markdown",
   python_requires='>=3.6',
@@ -22,7 +22,7 @@ setup(
       "tqdm",
       "pyarrow",
   ],
-  url="https://github.com/IIIS-Li-Group/OpenFE/",
+  url="https://github.com/AutoViML/Leakage_Free_OpenFE",
   packages=find_packages(),
   classifiers=[
   "Programming Language :: Python :: 3",

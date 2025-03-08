@@ -3,7 +3,9 @@ from .FeatureGenerator import Node, FNode
 from concurrent.futures import ProcessPoolExecutor
 import pandas as pd
 import numpy as np
-
+########################################################################
+# RS- Removed transform method so it can accept X_train only - all else same
+########################################################################
 
 def tree_to_formula(tree):
     if isinstance(tree, Node):
@@ -113,57 +115,6 @@ def _cal(feature, n_train):
            feature.data.values.ravel()[:n_train], \
            feature.data.values.ravel()[n_train:], \
            tree_to_formula(feature)
-
-
-def transform(X_train, X_test, new_features_list, n_jobs, name=""):
-    """ Transform train and test data according to new features. Since there are global operators such as
-    'GroupByThenMean', train and test data need to be transformed together.
-
-    :param X_train: pd.DataFrame, the train data
-    :param X_test:  pd.DataFrame, the test data
-    :param new_features_list: the new features to transform data.
-    :param n_jobs: the number of processes to calculate data
-    :param name: used for naming new features
-    :return: X_train, X_test. The transformed train and test data.
-    """
-    if len(new_features_list) == 0:
-        return X_train, X_test
-
-    data = pd.concat([X_train, X_test], axis=0)
-    data.index.name = 'openfe_index'
-    data.reset_index().to_feather('./openfe_tmp_data.feather')
-    n_train = len(X_train)
-    ex = ProcessPoolExecutor(n_jobs)
-    results = []
-    for feature in new_features_list:
-        results.append(ex.submit(_cal, feature, n_train))
-    ex.shutdown(wait=True)
-    _train = []
-    _test = []
-    names = []
-    names_map = {}
-    cat_feats = []
-    for i, res in enumerate(results):
-        is_cat, d1, d2, f = res.result()
-        names.append('autoFE_f_%d' % i + name)
-        names_map['autoFE_f_%d' % i + name] = f
-        _train.append(d1)
-        _test.append(d2)
-        if is_cat: cat_feats.append('autoFE_f_%d' % i + name)
-    _train = np.vstack(_train)
-    _test = np.vstack(_test)
-    _train = pd.DataFrame(_train.T, columns=names, index=X_train.index)
-    _test = pd.DataFrame(_test.T, columns=names, index=X_test.index)
-    for c in _train.columns:
-        if c in cat_feats:
-            _train[c] = _train[c].astype('category')
-            _test[c] = _test[c].astype('category')
-        else:
-            _train[c] = _train[c].astype('float')
-            _test[c] = _test[c].astype('float')
-    _train = pd.concat([X_train, _train], axis=1)
-    _test = pd.concat([X_test, _test], axis=1)
-    return _train, _test
 
 
 def rename_columns(df):
