@@ -176,22 +176,24 @@ Please do not use **conda or pip install** for installation since I have not cre
 
 ## ⚡️ A Quick Example of the Leakage-Free-OpenFE
 
-It only takes five lines of codes to generate features by Leakage-Free-OpenFE. First, we generate features by Leakage-Free-OpenFE.
-Next, we augment the train and test data by the generated features.
+It only takes five lines of code to generate features using Leakage-Free-OpenFE. First, we generate features, then we transform the train and test data separately to prevent data leakage:
 
+```python
+from leakage_free_openfe import OpenFE
+
+# Initialize the feature generator
+ofe = OpenFE()
+
+# Generate new features using training data only
+features = ofe.fit(data=X_train, label=y_train, n_jobs=n_jobs)  
+
+# Transform train data
+X_train = ofe.transform(X_train, is_train=True, new_features_list=features, n_jobs=n_jobs)
+
+# Transform test data using statistics learned from training data only
+X_test = ofe.transform(X_test, is_train=False, new_features_list=features, n_jobs=n_jobs)
 ```
-from leakage-free-openfe import Leakage-Free-OpenFE
-leak_free = Leakage-Free-OpenFE()
 
-# generate new features
-features = leak_free.fit(data=X_train, label=y_train, n_jobs=n_jobs)  
-
-# transform the train and test data according to generated features.
-X_train = transform(X_train, features, n_jobs=n_jobs) 
-
-X_test = transform(X_test, features, n_jobs=n_jobs) 
-```
-
-Everything else in the code from OpenFE is preserved. 
+Everything else in the code from OpenFE is preserved, but now without data leakage between train and test sets.
 
 I thank the original creators of OpenFE since I assume they embarked on this journey with the best of intentions to create a unique approach to feature generations. However their approach had a hidden flaw all too common in Kaggle competitions. Hence, I wanted to continue their journey but without the fatal flaw which would put real world ML projects at risk. I hope they will contribute to this attempt to make improvements to their library. Let's hope for the best!
